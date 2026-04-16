@@ -50,17 +50,12 @@ def safe_filename(name: str) -> str:
     return os.path.basename(name.replace("..", "").strip()) or "output.txt"
 
 def clean_code(raw: str) -> str:
-    """Strip markdown fences, print() statements, and return only executable code."""
+    """Strip markdown fences and return only executable code."""
     raw = re.sub(r"^```[\w]*\n?", "", raw.strip())
     raw = re.sub(r"\n?```$", "", raw.strip())
     if "```" in raw:
         raw = raw.split("```")[0].strip()
-    # Remove all print() statements (single and multi-line safe)
-    raw = re.sub(r'^[ \t]*print\s*\(.*?\)\s*$', '', raw, flags=re.MULTILINE)
-    # Remove lines that are purely comments starting with # (explanatory noise)
-    # Keep docstrings — only strip standalone #-comment-only lines
-    raw = re.sub(r'^[ \t]*#.*\n?', '', raw, flags=re.MULTILINE)
-    # Remove blank lines caused by deletions (collapse 3+ blank lines to 1)
+    # Collapse 3+ blank lines to 1
     raw = re.sub(r'\n{3,}', '\n\n', raw)
     return raw.strip()
 
@@ -77,6 +72,7 @@ def detect_language(text: str) -> str:
         ("sql",        r"\bsql\b"),
         ("html",       r"\bhtml\b"),
         ("css",        r"\bcss\b"),
+        ("c",          r"\bc language\b|\bin c\b|\bc program\b"),
         ("c++",        r"\bc\+\+\b|\bcpp\b"),
     ]:
         if re.search(pattern, text):
@@ -88,13 +84,15 @@ def infer_filename(text: str, lang: str) -> str:
         "python": "py", "javascript": "js", "typescript": "ts",
         "java": "java", "go": "go", "rust": "rs", "bash": "sh",
         "sql": "sql", "html": "html", "css": "css", "c++": "cpp",
+        "c": "c",
     }
     ext = ext_map.get(lang, "py")
     m = re.search(r'[\w\-]+\.' + ext, text)
     if m:
         return m.group(0)
     stopwords = {"a","an","the","to","for","and","or","write","create","make",
-                 "code","file","script","function","generate","python","javascript"}
+                 "code","file","script","function","generate","python","javascript",
+                 "program","in","using","with","that","this"}
     words = [w for w in re.findall(r'[a-z]+', text.lower()) if w not in stopwords]
     return ("_".join(words[:3]) or "output") + "." + ext
 
@@ -102,7 +100,6 @@ def normalize_intent(data: dict) -> dict:
     """Strict single-intent normalization with fallback to chat."""
     raw_intent = data.get("intent") or data.get("primary_intent") or "chat"
 
-    # If intent is a list or has multiple values, take first only
     if isinstance(raw_intent, list):
         raw_intent = raw_intent[0] if raw_intent else "chat"
 
@@ -131,8 +128,8 @@ def normalize_intent(data: dict) -> dict:
 @app.get("/health")
 def health():
     return {
-        "status": "ok",
-        "groq": bool(GROQ_API_KEY),
+        "status":     "ok",
+        "groq":       bool(GROQ_API_KEY),
         "openrouter": bool(OPENROUTER_API_KEY),
     }
 
@@ -144,23 +141,42 @@ async def transcribe(file: UploadFile = File(...)):
         raise HTTPException(400, "GROQ_API_KEY not set")
 
     audio_bytes = await file.read()
-    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "wav"
-    mime = {
-        "wav": "audio/wav", "mp3": "audio/mpeg", "m4a": "audio/mp4",
-        "ogg": "audio/ogg", "flac": "audio/flac", "webm": "audio/webm",
-    }.get(ext, "audio/wav")
+    if not audio_bytes:
+        raise HTTPException(400, "Empty audio file received")
+
+    # Determine extension — default webm for browser MediaRecorder blobs
+    raw_name = file.filename or "recording.webm"
+    ext = raw_name.rsplit(".", 1)[-1].lower() if "." in raw_name else "webm"
+
+    mime_map = {
+        "wav":  "audio/wav",
+        "mp3":  "audio/mpeg",
+        "m4a":  "audio/mp4",
+        "ogg":  "audio/ogg",
+        "flac": "audio/flac",
+        "webm": "audio/webm",
+    }
+    mime = mime_map.get(ext, "audio/webm")
+
+    # Ensure filename has a proper extension for Groq
+    safe_name = f"recording.{ext}"
 
     try:
         result = groq_client.audio.transcriptions.create(
-            file=(file.filename, audio_bytes, mime),
+            file=(safe_name, audio_bytes, mime),
             model="whisper-large-v3",
             response_format="verbose_json",
         )
+        text = result.text.strip() if result.text else ""
+        if not text:
+            raise HTTPException(422, "Transcription returned empty text. Please speak clearly and try again.")
         return {
-            "text":     result.text.strip(),
+            "text":     text,
             "language": getattr(result, "language", "en"),
             "duration": round(getattr(result, "duration", 0), 1),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"Transcription failed: {str(e)}")
 
@@ -189,10 +205,12 @@ Valid intents (pick ONLY one):
 - summarize   : user wants text summarized
 - chat        : general question or conversation
 
-IMPORTANT:
+IMPORTANT RULES:
+- If the user says "create a file X and write Y in it" → use write_code (because code content is requested)
+- If the user says "create a file X" with no code request → use create_file
 - Return ONLY one intent string — never a list, never two values.
 - If unsure, default to "chat".
-- Return ONLY a raw JSON object — no markdown, no explanation, no extra text.
+- Return ONLY a raw JSON object — no markdown fences, no explanation, no extra text before or after.
 
 Example output:
 {
@@ -220,8 +238,17 @@ Example output:
             return normalize_intent(_fallback_intent(req.text))
 
         raw = resp.choices[0].message.content.strip()
-        raw = re.sub(r"```json|```", "", raw).strip()
-        data = json.loads(raw)
+
+        # ── FIX: Robustly extract JSON even if model adds surrounding text ──
+        raw = re.sub(r'```(?:json)?', '', raw).strip()
+        raw = raw.replace('```', '').strip()
+
+        # Extract just the JSON object using regex
+        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if not json_match:
+            return normalize_intent(_fallback_intent(req.text))
+
+        data = json.loads(json_match.group(0))
         data["fallback"] = False
         return normalize_intent(data)
 
@@ -233,10 +260,16 @@ def _fallback_intent(text: str) -> dict:
     t = text.lower()
     if re.match(r'^summarize\s*[:\-]', t) or any(k in t for k in ["summarize", "summary", "tldr", "shorten"]):
         intent = "summarize"
-    elif any(k in t for k in ["write", "code", "function", "script", "generate", "implement"]):
+    elif any(k in t for k in ["write", "code", "function", "script", "generate", "implement", "program"]):
         intent = "write_code"
     elif any(k in t for k in ["create", "make", "new file", "touch", "folder"]):
-        intent = "create_file"
+        # ── FIX: if create_file also mentions code/program keywords → write_code ──
+        code_keywords = ["write", "program", "code", "function", "script", "implement",
+                         "hello", "world", "print", "fibonacci", "factorial", "sort"]
+        if any(k in t for k in code_keywords):
+            intent = "write_code"
+        else:
+            intent = "create_file"
     else:
         intent = "chat"
 
@@ -244,7 +277,7 @@ def _fallback_intent(text: str) -> dict:
     m = re.search(r'[\w\-]+\.\w{1,5}', text)
     return {
         "intent":     intent,
-        "confidence": 0.65,
+        "confidence": 0.75,
         "params": {
             "filename":    m.group(0) if m else None,
             "language":    lang,
@@ -275,6 +308,17 @@ def execute(req: ExecuteRequest):
 def _create_file(params: dict, text: str) -> dict:
     filename = safe_filename(params.get("filename") or "new_file.txt")
     filepath = OUTPUT_DIR / filename
+
+    # ── FIX: If user wants code written into the file, delegate to write_code ──
+    code_keywords = ["write", "program", "code", "function", "script", "implement",
+                     "hello", "world", "print", "fibonacci", "factorial", "sort",
+                     "algorithm", "class", "method", "loop"]
+    if any(k in text.lower() for k in code_keywords):
+        lang = detect_language(text)
+        params["language"] = lang
+        params["filename"] = filename
+        return _write_code(params, text)
+
     try:
         filepath.touch()
         return {
@@ -303,8 +347,11 @@ def _write_code(params: dict, text: str, regenerate: bool = False) -> dict:
         return {"action": "write_code", "output": "", "code": "", "filename": None, "error": code["error"]}
 
     clean = clean_code(code["code"])
+    if not clean:
+        return {"action": "write_code", "output": "", "code": "", "filename": None, "error": "Generated code was empty after cleaning."}
+
     try:
-        filepath.write_text(clean)
+        filepath.write_text(clean, encoding="utf-8")
         return {
             "action":   "write_code",
             "output":   f"✅ Code saved: output/{filename}",
@@ -321,9 +368,9 @@ def _generate_code_openrouter(text: str, lang: str, regenerate: bool) -> dict:
     try:
         sys_prompt = (
             f"You are an expert {lang} developer. "
-            "Return ONLY clean, minimal, production-ready code. "
-            "No print statements. No example usage. No explanations. No markdown fences. "
-            "Only the function or logic itself."
+            "Return ONLY clean, working, complete code. "
+            "No explanations. No markdown fences. "
+            "Only the complete, runnable code."
         )
         if regenerate:
             sys_prompt += " Generate a clean alternative implementation if possible."
@@ -368,9 +415,9 @@ def _generate_code_groq(text: str, lang: str, regenerate: bool) -> dict:
     try:
         sys_prompt = (
             f"You are an expert {lang} developer. "
-            "Return ONLY clean, minimal, production-ready code. "
-            "No print statements. No example usage. No explanations. No markdown fences. "
-            "Only the function or logic itself."
+            "Return ONLY clean, working, complete code. "
+            "No explanations. No markdown fences. "
+            "Only the complete, runnable code."
         )
         if regenerate:
             sys_prompt += " Generate a clean alternative implementation if possible."
@@ -401,7 +448,6 @@ def _summarize(params: dict, text: str, regenerate: bool = False) -> dict:
     if not clean_text:
         return {"action": "summarize", "output": "❌ No text provided to summarize.", "error": None}
 
-    # Detect binary/non-printable content
     if clean_text:
         non_printable = sum(
             1 for c in clean_text[:500]
@@ -497,7 +543,6 @@ def list_files():
 # ── Route 6: Download output file ─────────────────────────
 @app.get("/files/download/{filename}")
 def download_file(filename: str):
-    """Download a file from the output directory."""
     safe = safe_filename(filename)
     filepath = OUTPUT_DIR / safe
     if not filepath.exists():
@@ -507,37 +552,40 @@ def download_file(filename: str):
         filename=safe,
         media_type="application/octet-stream",
     )
-# ── Route 7: Delete output file ─────────────────────────
+
+
+# ── Route 7: Delete output file ───────────────────────────
 @app.delete("/files/{filename}")
 def delete_file(filename: str):
-    """Delete a file from the output directory."""
     safe = safe_filename(filename)
     filepath = OUTPUT_DIR / safe
-
     if not filepath.exists():
         raise HTTPException(status_code=404, detail="File not found")
-
     try:
         filepath.unlink()
         return {"message": f"Deleted {safe}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from pathlib import Path
-from pathlib import Path
+
+# ── Static frontend ────────────────────────────────────────
 from fastapi.staticfiles import StaticFiles
 
 BASE_DIR = Path(__file__).parent
 
-app.mount("/static/assets", StaticFiles(directory=BASE_DIR / "dist" / "assets"), name="static")
+dist_path = BASE_DIR / "dist"
+if dist_path.exists():
+    app.mount("/static/assets", StaticFiles(directory=dist_path / "assets"), name="static")
 
-@app.get("/")
-def serve_frontend():
-    return FileResponse("dist/index.html")
+    @app.get("/")
+    def serve_frontend():
+        return FileResponse(str(dist_path / "index.html"))
+else:
+    @app.get("/")
+    def serve_root():
+        return {"message": "VoiceAgent API is running. Frontend not built yet."}
+
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-

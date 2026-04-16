@@ -1,5 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 
+// ── FIX: Always use /health not / for status check
+// ── FIX: API base is empty string (same-origin), works for both local and Render
 const API = ''
 
 const COLORS = {
@@ -15,7 +17,6 @@ const ICONS = {
   chat:        '💬',
 }
 
-// Step 3 action label — maps intent → fixed display string (never uses backend output)
 const ACTION_LABELS = {
   write_code:  '💻 Code generated and saved',
   create_file: '📁 File created',
@@ -470,7 +471,11 @@ export default function App() {
   const recTimerRef  = useRef(null)
 
   useEffect(() => {
-    fetch(`${API}/`).then(r => r.json()).then(d => setApiStatus(d)).catch(() => {})
+    // ── FIX: Call /health (returns JSON) instead of / (returns HTML)
+    fetch(`${API}/health`)
+      .then(r => r.json())
+      .then(d => setApiStatus(d))
+      .catch(() => {})
     fetchFiles()
   }, [])
 
@@ -487,13 +492,35 @@ export default function App() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       chunksRef.current = []
-      const mr = new MediaRecorder(stream, { mimeType: 'audio/webm' })
+
+      // ── FIX: Detect supported mimeType at runtime (cross-browser/OS safe)
+      let mimeType = 'audio/webm'
+      if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+        mimeType = 'audio/webm;codecs=opus'
+      } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+        mimeType = 'audio/webm'
+      } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
+        mimeType = 'audio/ogg;codecs=opus'
+      } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+        mimeType = 'audio/mp4'
+      }
+
+      const mr = new MediaRecorder(stream, { mimeType })
+
       mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data) }
       mr.onstop = () => {
         stream.getTracks().forEach(t => t.stop())
-        const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
-        runPipeline('', blob, 'recording.webm')
+        const blob = new Blob(chunksRef.current, { type: mimeType })
+
+        // ── FIX: Pass correct extension based on actual mimeType used
+        let ext = 'webm'
+        if (mimeType.includes('ogg')) ext = 'ogg'
+        else if (mimeType.includes('mp4')) ext = 'mp4'
+        else ext = 'webm'
+
+        runPipeline('', blob, `recording.${ext}`)
       }
+
       mr.start()
       mediaRecRef.current = mr
       setIsRecording(true)
@@ -561,9 +588,13 @@ export default function App() {
         const form = new FormData()
         form.append('file', audioBlob, filename)
         const r = await fetch(`${API}/transcribe`, { method: 'POST', body: form })
-        if (!r.ok) throw new Error(await r.text())
+        if (!r.ok) {
+          const errText = await r.text()
+          throw new Error(`Transcription failed: ${errText}`)
+        }
         const d = await r.json()
         transcribed = d.text
+        if (!transcribed) throw new Error('Transcription returned empty text.')
       }
 
       // Step 2: Classify intent
@@ -633,7 +664,6 @@ export default function App() {
     }
   }
 
-  // Download a file from the output/ directory via backend
   function downloadOutputFile(filename) {
     const url = `${API}/files/download/${encodeURIComponent(filename)}`
     const a   = document.createElement('a')
@@ -644,7 +674,6 @@ export default function App() {
     document.body.removeChild(a)
   }
 
-  // Delete a file from the output/ directory via backend
   async function deleteOutputFile(filename) {
     if (!window.confirm(`Delete "${filename}" from output folder?`)) return
     try {
@@ -670,7 +699,7 @@ export default function App() {
       <div style={styles.header}>
         <span style={{ fontSize: '20px' }}>🎙️</span>
         <span style={styles.logo}>VoiceAgent</span>
-        <span style={styles.badge}>AI · LOCAL</span>
+        <span style={styles.badge}>AI</span>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: '12px', alignItems: 'center' }}>
           <span style={{ fontSize: '12px' }}><span style={styles.dot(apiStatus.groq)} />Groq</span>
           <span style={{ fontSize: '12px' }}><span style={styles.dot(apiStatus.openrouter)} />OpenRouter</span>
@@ -782,7 +811,7 @@ export default function App() {
 
           <hr style={styles.divider} />
 
-          {/* Output files with download + delete */}
+          {/* Output files */}
           <div>
             <div style={{ ...styles.sectionLabel, display: 'flex', justifyContent: 'space-between' }}>
               <span>Output Files</span>
@@ -900,14 +929,12 @@ export default function App() {
               {/* 4-step pipeline grid */}
               <div style={styles.pipelineGrid}>
 
-                {/* Step 1 · Input / Transcription */}
                 <StepCard
                   label="Step 1 · Input"
                   content={result.text}
                   color="#38bdf8"
                 />
 
-                {/* Step 2 · Intent + confidence */}
                 <div style={styles.card}>
                   <div style={{ ...styles.cardAccent, background: COLORS[intent] || '#64748b' }} />
                   <div style={{ ...styles.cardLabel, color: COLORS[intent] || '#64748b' }}>Step 2 · Intent</div>
@@ -927,7 +954,6 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Step 3 · Action (fixed message only — never backend output) */}
                 <StepCard
                   label="Step 3 · Action"
                   content={
@@ -940,7 +966,6 @@ export default function App() {
                   color="#a78bfa"
                 />
 
-                {/* Step 4 · Status (success / error — no duplication of output) */}
                 <StepCard
                   label="Step 4 · Status"
                   content={
@@ -968,7 +993,6 @@ export default function App() {
                     language={result.executionResult.language}
                     filename={result.executionResult.filename}
                   />
-                  {/* Download + Delete buttons for saved file */}
                   {result.executionResult.filename && (
                     <div style={{ marginTop: '8px', display: 'flex', gap: '8px' }}>
                       <button
@@ -1022,7 +1046,7 @@ export default function App() {
                 </div>
               )}
 
-              {/* Regenerate button — only for chat / summarize / write_code, not create_file */}
+              {/* Regenerate button */}
               {['chat', 'summarize', 'write_code'].includes(intent)
                 && result.executionResult
                 && !result.executionResult.error
