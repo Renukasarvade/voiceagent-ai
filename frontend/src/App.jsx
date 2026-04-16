@@ -576,6 +576,7 @@ export default function App() {
 
   // ── Pipeline ─────────────────────────────────────────────
   async function runPipeline(text, audioBlob = null, filename = 'audio.webm') {
+    console.log("INPUT SENT:", text)
     setLoading(true)
     setResult(null)
     setConfirmPending(null)
@@ -656,13 +657,7 @@ export default function App() {
     }
   }
 
-  function handleSubmit() {
-    if (inputMode === 'text' && textInput.trim()) {
-      runPipeline(textInput.trim())
-    } else if (inputMode === 'audio' && audioFile) {
-      runPipeline('', audioFile, audioFile.name)
-    }
-  }
+
 
   function downloadOutputFile(filename) {
     const url = `${API}/files/download/${encodeURIComponent(filename)}`
