@@ -486,6 +486,26 @@ export default function App() {
       setOutputFiles(d.files || [])
     } catch { }
   }
+  function handleSubmit() {
+    if (inputMode === 'text') {
+      const clean = textInput.trim()
+
+      if (!clean) {
+        alert("Please enter a command ❗")
+        return
+      }
+
+      runPipeline(clean)
+    } 
+    else if (inputMode === 'audio') {
+      if (!audioFile) {
+        alert("Please upload or record audio ❗")
+        return
+      }
+
+      runPipeline('', audioFile, audioFile.name)
+    }
+  }
 
   // ── Recording ────────────────────────────────────────────
   async function startRecording() {
