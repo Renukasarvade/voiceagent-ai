@@ -576,7 +576,7 @@ export default function App() {
 
   // ── Pipeline ─────────────────────────────────────────────
   async function runPipeline(text, audioBlob = null, filename = 'audio.webm') {
-    console.log("INPUT SENT:", text)
+     console.log("INPUT SENT:", text) 
     setLoading(true)
     setResult(null)
     setConfirmPending(null)
@@ -595,6 +595,7 @@ export default function App() {
         }
         const d = await r.json()
         transcribed = d.text
+           console.log("TRANSCRIBED TEXT:", transcribed)
         if (!transcribed) throw new Error('Transcription returned empty text.')
       }
 
